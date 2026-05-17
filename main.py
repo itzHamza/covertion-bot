@@ -1,9 +1,21 @@
 import os
+import re
 import subprocess
 import tempfile
 import logging
 import telebot
+import yt_dlp
 from telebot.types import Message
+
+URL_REGEX = re.compile(r"https?://\S+")
+
+SUPPORTED_DOMAINS = [
+    "tiktok.com", "vt.tiktok.com",
+    "youtube.com", "youtu.be",
+    "instagram.com",
+    "twitter.com", "x.com",
+    "facebook.com", "fb.watch",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +61,40 @@ def convert_to_aac(input_path: str) -> str:
     return output_path
 
 
+def is_supported_url(url: str) -> bool:
+    """Check if URL is from a supported platform."""
+    return any(domain in url for domain in SUPPORTED_DOMAINS)
+
+
+def download_url_to_aac(url: str) -> tuple[str, str]:
+    """Download audio from a URL using yt-dlp. Returns (aac_path, title)."""
+    tmp_dir = tempfile.mkdtemp()
+    output_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "aac",
+            "preferredquality": "192",
+        }],
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        title = info.get("title", "audio")
+
+    # Find the output .aac file
+    for fname in os.listdir(tmp_dir):
+        if fname.endswith(".aac") or fname.endswith(".m4a"):
+            return os.path.join(tmp_dir, fname), title
+
+    raise RuntimeError("yt-dlp did not produce an AAC/M4A file")
+
+
 def handle_video_file(message: Message, file_id: str, file_name: str = "audio"):
     """Core handler: download → convert → reply → cleanup."""
     input_path = None
@@ -85,9 +131,57 @@ def handle_video_file(message: Message, file_id: str, file_name: str = "audio"):
 def handle_start(message: Message):
     bot.reply_to(
         message,
-        "🎬 Send me any MP4 video and I'll extract the audio as an AAC file.\n\n"
-        "Just drop your video here!"
+        "🎬 *What I can do:*\n\n"
+        "• Send me an MP4 video → get AAC audio\n"
+        "• Send me a TikTok / YouTube / Instagram link → get AAC audio\n\n"
+        "Just drop a video or a link here!",
+        parse_mode="Markdown"
     )
+
+
+@bot.message_handler(content_types=["text"])
+def handle_text(message: Message):
+    """Detect URLs in text messages and process supported ones."""
+    text = message.text or ""
+    urls = URL_REGEX.findall(text)
+
+    if not urls:
+        bot.reply_to(message, "⚠️ Send me an MP4 video or a supported link (TikTok, YouTube, Instagram...).")
+        return
+
+    url = urls[0]  # process first URL found
+
+    if not is_supported_url(url):
+        bot.reply_to(message, "⚠️ Unsupported link. Supported: TikTok, YouTube, Instagram, Twitter/X, Facebook.")
+        return
+
+    output_path = None
+    try:
+        bot.reply_to(message, "⏳ Downloading and extracting audio, please wait...")
+        logger.info(f"Processing URL: {url}")
+
+        output_path, title = download_url_to_aac(url)
+
+        with open(output_path, "rb") as audio_file:
+            bot.send_audio(
+                message.chat.id,
+                audio_file,
+                caption="✅ Here is your AAC audio!",
+                title=title,
+                reply_to_message_id=message.message_id
+            )
+        logger.info(f"Sent AAC to chat {message.chat.id} — title: {title}")
+
+    except Exception as e:
+        logger.error(f"Error processing URL {url}: {e}")
+        bot.reply_to(message, f"❌ Failed to process link: {e}")
+    finally:
+        if output_path and os.path.exists(output_path):
+            tmp_dir = os.path.dirname(output_path)
+            for f in os.listdir(tmp_dir):
+                os.remove(os.path.join(tmp_dir, f))
+            os.rmdir(tmp_dir)
+            logger.info(f"Cleaned up temp dir")
 
 
 @bot.message_handler(content_types=["video"])
